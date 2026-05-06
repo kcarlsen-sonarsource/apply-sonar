@@ -1,0 +1,6 @@
+.sonar/
+.sonarlint/
+.scannerwork/
+sonar-project.properties
+*.tmp
+/tmp/
