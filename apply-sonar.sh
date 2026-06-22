@@ -28,7 +28,7 @@ mktmp() {
 }
 # shellcheck disable=SC2329
 cleanup() { rm -f "${TMPFILES[@]+"${TMPFILES[@]}"}"; }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 # ---------------------------------------------------------------------------
 # Output formatting
@@ -163,7 +163,7 @@ check_prerequisites() {
     if [[ -n "$missing" ]]; then
         log_error "Missing required tools:" \
             "" \
-            "$(echo -e "$missing")" \
+            "$(printf '%b' "$missing")" \
             "Install them and re-run this script."
         exit 1
     fi
@@ -215,7 +215,17 @@ ensure_sonar_cli() {
     fi
 
     log_info "Installing sonar CLI..."
-    curl -fsSL https://raw.githubusercontent.com/SonarSource/sonarqube-cli/refs/heads/master/user-scripts/install.sh | bash
+    local install_exit=0
+    set +e
+    curl -fsSL --connect-timeout 10 --max-time 300 \
+        https://raw.githubusercontent.com/SonarSource/sonarqube-cli/refs/heads/master/user-scripts/install.sh | bash
+    install_exit=$?
+    set -e
+    if [[ "$install_exit" -ne 0 ]]; then
+        log_error "sonar CLI installation script failed (exit $install_exit)." \
+            "Try installing manually: https://docs.sonarsource.com/sonarqube-cloud/advanced-setup/ci-based-analysis/sonarqube-cli/"
+        exit 1
+    fi
 
     if [[ ! -x "$local_bin" ]]; then
         log_error "Installation failed — sonar CLI not found at $local_bin." \
@@ -267,7 +277,8 @@ resolve_token() {
         local response
         local curl_exit=0
         set +e
-        response="$(curl -sS -H "Authorization: Bearer $candidate" "$validate_url")"
+        response="$(curl -sS --connect-timeout 10 --max-time 30 \
+            -H "Authorization: Bearer $candidate" "$validate_url")"
         curl_exit=$?
         set -e
         if [[ "$curl_exit" -ne 0 ]]; then
@@ -320,7 +331,16 @@ ensure_auth() {
             if [[ "$DRY_RUN" = true ]]; then
                 log_dryrun "Would run: sonar auth login -t <token> -o $ORG_KEY"
             else
+                local login_exit=0
+                set +e
                 "$SONAR_CLI" auth login -t "$TOKEN" -o "$ORG_KEY"
+                login_exit=$?
+                set -e
+                if [[ "$login_exit" -ne 0 ]]; then
+                    log_error "sonar CLI login failed (exit $login_exit)." \
+                        "Check that your CLI version supports -t and -o flags, or log in manually: sonar auth login"
+                    exit 1
+                fi
             fi
         fi
         resolve_token
@@ -349,7 +369,16 @@ ensure_auth() {
         if [[ "$DRY_RUN" = true ]]; then
             log_dryrun "Would run: sonar auth login"
         else
+            local login_exit=0
+            set +e
             "$SONAR_CLI" auth login
+            login_exit=$?
+            set -e
+            if [[ "$login_exit" -ne 0 ]]; then
+                log_error "Authentication failed." \
+                    "Try again, or pass --token <token> and --org <key> directly."
+                exit 1
+            fi
 
             local recheck_output
             local recheck_exit=0
@@ -397,6 +426,12 @@ detect_project_info() {
         PROJECT_KEY="$(echo "$PROJECT_KEY" | sed 's/[^a-zA-Z0-9_.:-]/-/g' | cut -c1-400)"
     fi
 
+    if [[ "$PROJECT_KEY" =~ [^a-zA-Z0-9_.:-] ]]; then
+        log_error "Invalid project key: $PROJECT_KEY" \
+            "Project keys may only contain letters, digits, underscores, dots, colons, and hyphens."
+        exit 1
+    fi
+
     if [[ -z "$PROJECT_NAME" ]]; then
         PROJECT_NAME="$repo_name"
     fi
@@ -420,9 +455,19 @@ ensure_project_exists() {
     tmp_body="$(mktmp)"
 
     local http_code
-    http_code="$(curl -sS -o "$tmp_body" -w "%{http_code}" \
+    local curl_exit=0
+    set +e
+    http_code="$(curl -sS --connect-timeout 10 --max-time 30 \
+        -o "$tmp_body" -w "%{http_code}" \
         -H "Authorization: Bearer $TOKEN" \
         "$SERVER_URL/api/components/show?component=$PROJECT_KEY")"
+    curl_exit=$?
+    set -e
+    if [[ "$curl_exit" -ne 0 ]]; then
+        log_error "Could not reach SonarQube Cloud (curl exit $curl_exit)." \
+            "Check your network connection and try again."
+        exit 1
+    fi
 
     case "$http_code" in
         200)
@@ -449,12 +494,22 @@ ensure_project_exists() {
     tmp_create="$(mktmp)"
 
     local create_code
-    create_code="$(curl -sS -o "$tmp_create" -w "%{http_code}" -X POST \
+    curl_exit=0
+    set +e
+    create_code="$(curl -sS --connect-timeout 10 --max-time 30 \
+        -o "$tmp_create" -w "%{http_code}" -X POST \
         -H "Authorization: Bearer $TOKEN" \
         --data-urlencode "organization=$ORG_KEY" \
         --data-urlencode "project=$PROJECT_KEY" \
         --data-urlencode "name=$PROJECT_NAME" \
         "$SERVER_URL/api/projects/create")"
+    curl_exit=$?
+    set -e
+    if [[ "$curl_exit" -ne 0 ]]; then
+        log_error "Could not reach SonarQube Cloud (curl exit $curl_exit)." \
+            "Check your network connection and try again."
+        exit 1
+    fi
 
     case "$create_code" in
         2*)
@@ -498,11 +553,21 @@ configure_project_settings() {
 
     for setting_key in sonar.leak.period sonar.leak.period.type; do
         local status
-        status="$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+        local curl_exit=0
+        set +e
+        status="$(curl -sS --connect-timeout 10 --max-time 30 \
+            -o /dev/null -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "component=$PROJECT_KEY&key=$setting_key&value=previous_version" \
+            --data-urlencode "component=$PROJECT_KEY" \
+            --data-urlencode "key=$setting_key" \
+            --data-urlencode "value=previous_version" \
             "$SERVER_URL/api/settings/set")"
+        curl_exit=$?
+        set -e
+        if [[ "$curl_exit" -ne 0 ]]; then
+            log_info "Could not reach SonarQube Cloud to set project settings. Non-critical — continuing."
+            return
+        fi
 
         case "$status" in
             200|204) ;;
@@ -587,7 +652,7 @@ ensure_scanner() {
         return
     fi
 
-    if docker --version > /dev/null 2>&1; then
+    if docker info > /dev/null 2>&1; then
         USE_DOCKER=true
         SCANNER_CMD="docker"
         log_info "Using Docker for sonar-scanner."
@@ -640,11 +705,54 @@ ensure_scanner() {
 
     local zip_file
     zip_file="$(mktmp)"
-    curl -fSL -o "$zip_file" "$url"
+    local curl_exit=0
+    set +e
+    curl -fSL --connect-timeout 10 --max-time 300 -o "$zip_file" "$url"
+    curl_exit=$?
+    set -e
+    if [[ "$curl_exit" -ne 0 ]]; then
+        log_error "Failed to download sonar-scanner (curl exit $curl_exit)." \
+            "Check your network connection and try again."
+        exit 1
+    fi
+
+    local sha_url="${url}.sha256"
+    local expected_sha=""
+    set +e
+    expected_sha="$(curl -fsSL --connect-timeout 10 --max-time 15 "$sha_url" | awk '{print $1}')"
+    set -e
+    if [[ -n "$expected_sha" ]]; then
+        local actual_sha
+        if command -v sha256sum > /dev/null 2>&1; then
+            actual_sha="$(sha256sum "$zip_file" | awk '{print $1}')"
+        else
+            actual_sha="$(shasum -a 256 "$zip_file" | awk '{print $1}')"
+        fi
+        if [[ "$expected_sha" != "$actual_sha" ]]; then
+            log_error "Checksum mismatch for sonar-scanner download." \
+                "Expected: $expected_sha" \
+                "Got:      $actual_sha" \
+                "The download may be corrupted. Try again or install manually."
+            exit 1
+        fi
+        log_verbose "Checksum verified."
+    else
+        log_verbose "Could not fetch checksum file — skipping verification."
+    fi
 
     rm -rf "$HOME/.sonar/sonar-scanner/"
     unzip -qo "$zip_file" -d "$HOME/.sonar/"
-    mv "$HOME/.sonar/sonar-scanner-cli-${SCANNER_VERSION}-"*/ "$HOME/.sonar/sonar-scanner/"
+
+    local extracted_dir=""
+    for extracted_dir in "$HOME/.sonar/sonar-scanner-cli-${SCANNER_VERSION}-"*/; do
+        break
+    done
+    if [[ ! -d "$extracted_dir" ]]; then
+        log_error "Scanner zip did not extract as expected." \
+            "Check the contents of $HOME/.sonar/ and try installing manually."
+        exit 1
+    fi
+    mv "$extracted_dir" "$HOME/.sonar/sonar-scanner/"
 
     if [[ "$os_name" = "Darwin" ]]; then
         xattr -dr com.apple.quarantine "$HOME/.sonar/sonar-scanner/" 2>/dev/null || true
@@ -779,7 +887,8 @@ show_results() {
     sleep 3
 
     local gate_response gate_status display_status
-    gate_response="$(curl -sS -H "Authorization: Bearer $TOKEN" \
+    gate_response="$(curl -sS --connect-timeout 10 --max-time 30 \
+        -H "Authorization: Bearer $TOKEN" \
         "$SERVER_URL/api/qualitygates/project_status?projectKey=$PROJECT_KEY" 2>/dev/null || true)"
 
     gate_status="$(echo "$gate_response" | jq -r '.projectStatus.status // empty' 2>/dev/null || true)"
@@ -787,7 +896,7 @@ show_results() {
     case "$gate_status" in
         OK)    display_status="Passed" ;;
         ERROR) display_status="Failed" ;;
-        NONE)  display_status="Not Computed (evaluates on next code change)" ;;
+        NONE)  display_status="Not Computed — normal for a first scan. Push a change and scan again to see results." ;;
         WARN)  display_status="Warning" ;;
         *)     display_status="Unknown" ;;
     esac
