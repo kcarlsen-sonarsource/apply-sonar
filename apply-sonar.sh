@@ -14,6 +14,7 @@ VERBOSE=false
 FORCE=false
 INTEGRATE_CLAUDE=false
 SONAR_CLI=""
+SONAR_CLI_HAS_API=false
 SCANNER_VERSION="8.0.1.6346"
 SCANNER_CMD=""
 USE_DOCKER=false
@@ -182,18 +183,28 @@ check_prerequisites() {
 # ---------------------------------------------------------------------------
 # Function: ensure_sonar_cli
 # ---------------------------------------------------------------------------
-ensure_sonar_cli() {
+detect_sonar_cli() {
     local local_bin="$HOME/.local/share/sonarqube-cli/bin/sonar"
 
     if command -v sonar > /dev/null 2>&1; then
         SONAR_CLI="$(command -v sonar)"
         log_verbose "Found sonar CLI on PATH: $SONAR_CLI"
-        return
-    fi
-
-    if [[ -x "$local_bin" ]]; then
+    elif [[ -x "$local_bin" ]]; then
         SONAR_CLI="$local_bin"
         log_verbose "Found sonar CLI at: $SONAR_CLI"
+    else
+        return 1
+    fi
+
+    if "$SONAR_CLI" api --help > /dev/null 2>&1; then
+        SONAR_CLI_HAS_API=true
+        log_verbose "sonar CLI supports 'api' subcommand."
+    fi
+    return 0
+}
+
+ensure_sonar_cli() {
+    if detect_sonar_cli; then
         return
     fi
 
@@ -201,7 +212,7 @@ ensure_sonar_cli() {
 
     if [[ "$DRY_RUN" = true ]]; then
         log_dryrun "Would install sonar CLI"
-        SONAR_CLI="$local_bin"
+        SONAR_CLI="$HOME/.local/share/sonarqube-cli/bin/sonar"
         return
     fi
 
@@ -227,6 +238,7 @@ ensure_sonar_cli() {
         exit 1
     fi
 
+    local local_bin="$HOME/.local/share/sonarqube-cli/bin/sonar"
     if [[ ! -x "$local_bin" ]]; then
         log_error "Installation failed — sonar CLI not found at $local_bin." \
             "Try installing manually: https://docs.sonarsource.com/sonarqube-cloud/advanced-setup/ci-based-analysis/sonarqube-cli/"
@@ -234,6 +246,9 @@ ensure_sonar_cli() {
     fi
 
     SONAR_CLI="$local_bin"
+    if "$SONAR_CLI" api --help > /dev/null 2>&1; then
+        SONAR_CLI_HAS_API=true
+    fi
     log_success "sonar CLI installed at: $SONAR_CLI"
 }
 
@@ -253,6 +268,10 @@ resolve_token() {
     fi
 
     if [[ ${#sources[@]} -eq 0 ]]; then
+        if [[ "$SONAR_CLI_HAS_API" = true ]]; then
+            log_verbose "No token in env vars, but sonar CLI is available — will use CLI for API calls."
+            return
+        fi
         log_error "No API token available." \
             "The sonar CLI stores tokens in the OS keychain, which this script cannot access directly." \
             "Set SONAR_TOKEN environment variable, or pass --token <token>." \
@@ -293,6 +312,11 @@ resolve_token() {
         log_verbose "Token from $label is not valid."
     done
 
+    if [[ "$SONAR_CLI_HAS_API" = true ]]; then
+        log_verbose "No valid env var token, but sonar CLI is available — will use CLI for API calls."
+        return
+    fi
+
     log_error "No valid API token found." \
         "Generate a new token at: $SERVER_URL/account/security"
     exit 1
@@ -326,23 +350,6 @@ parse_auth_status() {
 # ---------------------------------------------------------------------------
 ensure_auth() {
     if [[ -n "$TOKEN" ]] && [[ -n "$ORG_KEY" ]]; then
-        if [[ -n "$SONAR_CLI" ]]; then
-            log_info "Logging in with provided token and org..."
-            if [[ "$DRY_RUN" = true ]]; then
-                log_dryrun "Would run: sonar auth login -t <token> -o $ORG_KEY"
-            else
-                local login_exit=0
-                set +e
-                "$SONAR_CLI" auth login -t "$TOKEN" -o "$ORG_KEY"
-                login_exit=$?
-                set -e
-                if [[ "$login_exit" -ne 0 ]]; then
-                    log_error "sonar CLI login failed (exit $login_exit)." \
-                        "Check that your CLI version supports -t and -o flags, or log in manually: sonar auth login"
-                    exit 1
-                fi
-            fi
-        fi
         resolve_token
         return
     fi
@@ -443,6 +450,88 @@ detect_project_info() {
 }
 
 # ---------------------------------------------------------------------------
+# Function: validate_org_access
+# ---------------------------------------------------------------------------
+validate_org_access() {
+    if [[ "$DRY_RUN" = true ]]; then
+        log_dryrun "Would validate access to organization: $ORG_KEY"
+        return
+    fi
+
+    local org_response=""
+
+    if [[ "$SONAR_CLI_HAS_API" = true ]]; then
+        local cli_exit=0
+        set +e
+        org_response="$("$SONAR_CLI" api get "/api/organizations/search?organizations=$ORG_KEY&member=true" 2>/dev/null)"
+        cli_exit=$?
+        set -e
+        if [[ "$cli_exit" -ne 0 ]]; then
+            log_verbose "Org validation via CLI failed — skipping pre-check."
+            return
+        fi
+    else
+        local tmp_org
+        tmp_org="$(mktmp)"
+        local http_code
+        local curl_exit=0
+        set +e
+        http_code="$(curl -sS --connect-timeout 10 --max-time 30 \
+            -o "$tmp_org" -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            "$SERVER_URL/api/organizations/search?organizations=$ORG_KEY&member=true")"
+        curl_exit=$?
+        set -e
+        if [[ "$curl_exit" -ne 0 ]] || [[ "$http_code" != "200" ]]; then
+            log_verbose "Org validation returned HTTP $http_code — skipping pre-check."
+            return
+        fi
+        org_response="$(cat "$tmp_org")"
+    fi
+
+    local org_count
+    org_count="$(echo "$org_response" | jq -r '.paging.total // 0' 2>/dev/null || echo "0")"
+
+    if [[ "$org_count" -eq 0 ]]; then
+        # Org not found as member — check if the org exists at all (unauthenticated)
+        local pub_response=""
+        set +e
+        pub_response="$(curl -sS --connect-timeout 10 --max-time 30 \
+            "$SERVER_URL/api/organizations/search?organizations=$ORG_KEY" 2>/dev/null)"
+        set -e
+        local exists_count
+        exists_count="$(echo "$pub_response" | jq -r '.paging.total // 0' 2>/dev/null || echo "0")"
+
+        if [[ "$exists_count" -gt 0 ]]; then
+            log_error "Your account is not a member of organization '$ORG_KEY'." \
+                "" \
+                "Check that:" \
+                "  1. You are a member of '$ORG_KEY' on SonarQube Cloud" \
+                "  2. Run 'sonar auth status' to verify which account is active" \
+                "  3. If needed, re-authenticate: sonar auth logout && sonar auth login"
+        else
+            log_error "Organization '$ORG_KEY' was not found on SonarQube Cloud." \
+                "" \
+                "Check the organization key at: $SERVER_URL/organizations" \
+                "Common mistakes:" \
+                "  - Typo in the org key (it's case-sensitive)" \
+                "  - Using the display name instead of the key" \
+                "  - The organization hasn't been created yet"
+        fi
+        exit 1
+    fi
+
+    local can_provision
+    can_provision="$(echo "$org_response" | jq -r '.organizations[0].actions.provision // false' 2>/dev/null || echo "false")"
+    if [[ "$can_provision" != "true" ]]; then
+        log_info "You may not have permission to create projects in '$ORG_KEY'."
+        log_info "If project creation fails, ask an org admin to grant you the 'Create Projects' permission."
+    fi
+
+    log_verbose "Organization access validated: $ORG_KEY"
+}
+
+# ---------------------------------------------------------------------------
 # Function: ensure_project_exists
 # ---------------------------------------------------------------------------
 ensure_project_exists() {
@@ -451,6 +540,87 @@ ensure_project_exists() {
         return
     fi
 
+    # --- Check if project already exists ---
+    if [[ "$SONAR_CLI_HAS_API" = true ]]; then
+        ensure_project_exists_via_cli
+    else
+        ensure_project_exists_via_curl
+    fi
+}
+
+# Uses `sonar api` (keychain token) — preferred path.
+ensure_project_exists_via_cli() {
+    local check_output
+    local check_exit=0
+    set +e
+    check_output="$("$SONAR_CLI" api get "/api/components/show?component=$PROJECT_KEY" 2>&1)"
+    check_exit=$?
+    set -e
+
+    if [[ "$check_exit" -eq 0 ]] && echo "$check_output" | jq -e '.component' > /dev/null 2>&1; then
+        log_success "Project already exists in SonarQube Cloud."
+        return
+    fi
+
+    log_verbose "Project does not exist yet — will create."
+
+    local create_data
+    create_data="$(jq -n \
+        --arg org "$ORG_KEY" \
+        --arg proj "$PROJECT_KEY" \
+        --arg name "$PROJECT_NAME" \
+        '{organization: $org, project: $proj, name: $name}')"
+
+    local tmp_create_err
+    tmp_create_err="$(mktmp)"
+
+    local create_output
+    local create_exit=0
+    set +e
+    create_output="$("$SONAR_CLI" api post "/api/projects/create" --data "$create_data" 2>"$tmp_create_err")"
+    create_exit=$?
+    set -e
+
+    local create_err
+    create_err="$(cat "$tmp_create_err" 2>/dev/null || echo '')"
+
+    if [[ "$create_exit" -eq 0 ]] && echo "$create_output" | jq -e '.project' > /dev/null 2>&1; then
+        log_success "Project created: $PROJECT_KEY"
+        return
+    fi
+
+    # Parse the error from sonar api stderr
+    local err_msg="$create_err"
+    if echo "$create_err" | grep -qi "No organization for key"; then
+        log_error "Organization '$ORG_KEY' was not found or your account does not have access." \
+            "" \
+            "Check that:" \
+            "  1. The organization key '$ORG_KEY' is correct (case-sensitive)" \
+            "  2. Your authenticated account is a member of this organization" \
+            "  3. Run 'sonar auth status' to verify which account is active" \
+            "" \
+            "To re-authenticate: sonar auth logout && sonar auth login"
+        exit 1
+    elif echo "$create_err" | grep -qi "key already exists"; then
+        log_error "Project key '$PROJECT_KEY' already exists." \
+            "Use --key <key> to specify a different project key."
+        exit 1
+    elif echo "$create_err" | grep -qi "Insufficient privileges\|permission\|403\|401"; then
+        log_error "Permission denied creating project in '$ORG_KEY'." \
+            "Your account needs the 'Create Projects' permission." \
+            "Ask an organization admin to grant access, or use a different token."
+        exit 1
+    else
+        log_error "Failed to create project:" \
+            "$err_msg" \
+            "" \
+            "Run 'sonar auth status' to check your authentication."
+        exit 1
+    fi
+}
+
+# Fallback: uses curl with TOKEN from env vars.
+ensure_project_exists_via_curl() {
     local tmp_body
     tmp_body="$(mktmp)"
 
@@ -511,32 +681,54 @@ ensure_project_exists() {
         exit 1
     fi
 
+    local create_body
+    create_body="$(cat "$tmp_create" 2>/dev/null || echo '')"
+
     case "$create_code" in
         2*)
-            local create_response
-            create_response="$(cat "$tmp_create")"
-            if echo "$create_response" | jq -e '.project' > /dev/null 2>&1; then
+            if echo "$create_body" | jq -e '.project' > /dev/null 2>&1; then
                 log_success "Project created: $PROJECT_KEY"
-            elif echo "$create_response" | grep -qi "key already exists"; then
+            elif echo "$create_body" | grep -qi "key already exists"; then
                 log_error "Project key '$PROJECT_KEY' already exists." \
                     "Use --key <key> to specify a different project key."
                 exit 1
             else
                 local err_msg
-                err_msg="$(echo "$create_response" | jq -r '.errors[]?.msg // empty' 2>/dev/null || echo "$create_response")"
+                err_msg="$(echo "$create_body" | jq -r '.errors[]?.msg // empty' 2>/dev/null || echo "$create_body")"
                 log_error "Failed to create project:" "$err_msg"
                 exit 1
             fi
             ;;
+        404)
+            local err_msg
+            err_msg="$(echo "$create_body" | jq -r '.errors[]?.msg // empty' 2>/dev/null || echo "$create_body")"
+            if echo "$err_msg" | grep -qi "No organization for key"; then
+                log_error "Organization '$ORG_KEY' was not found or your token does not have access." \
+                    "" \
+                    "Check that:" \
+                    "  1. The organization key '$ORG_KEY' is correct (case-sensitive)" \
+                    "  2. Your SONAR_TOKEN belongs to an account that is a member of this organization" \
+                    "  3. If you used 'sonar auth login', the token is in the OS keychain —" \
+                    "     set SONAR_TOKEN to match, or pass --token <token>" \
+                    "" \
+                    "List your organizations: curl -H 'Authorization: Bearer \$SONAR_TOKEN' \\
+                    $SERVER_URL/api/organizations/search?member=true"
+            else
+                log_error "Project creation failed (HTTP 404):" "$err_msg"
+            fi
+            exit 1
+            ;;
         401|403)
             log_error "Authentication/authorization error creating project (HTTP $create_code)." \
-                "Check that your token has the 'Administer' permission for the organization." \
+                "Check that your token has the 'Create Projects' permission for the organization." \
                 "Generate a new token at: $SERVER_URL/account/security"
             exit 1
             ;;
         *)
+            local err_msg
+            err_msg="$(echo "$create_body" | jq -r '.errors[]?.msg // empty' 2>/dev/null || echo "$create_body")"
             log_error "Unexpected response creating project (HTTP $create_code):" \
-                "$(cat "$tmp_create" 2>/dev/null || echo '(no body)')"
+                "${err_msg:-$(echo "$create_body")}"
             exit 1
             ;;
     esac
@@ -551,35 +743,59 @@ configure_project_settings() {
         return
     fi
 
+    local use_cli=false
+    if [[ "$SONAR_CLI_HAS_API" = true ]]; then
+        use_cli=true
+    fi
+
     for setting_key in sonar.leak.period sonar.leak.period.type; do
-        local status
-        local curl_exit=0
-        set +e
-        status="$(curl -sS --connect-timeout 10 --max-time 30 \
-            -o /dev/null -w "%{http_code}" -X POST \
-            -H "Authorization: Bearer $TOKEN" \
-            --data-urlencode "component=$PROJECT_KEY" \
-            --data-urlencode "key=$setting_key" \
-            --data-urlencode "value=previous_version" \
-            "$SERVER_URL/api/settings/set")"
-        curl_exit=$?
-        set -e
-        if [[ "$curl_exit" -ne 0 ]]; then
-            log_info "Could not reach SonarQube Cloud to set project settings. Non-critical — continuing."
-            return
+        local set_exit=0
+
+        if [[ "$use_cli" = true ]]; then
+            local set_data
+            set_data="$(jq -n \
+                --arg comp "$PROJECT_KEY" \
+                --arg key "$setting_key" \
+                --arg val "previous_version" \
+                '{component: $comp, key: $key, value: $val}')"
+            set +e
+            "$SONAR_CLI" api post "/api/settings/set" --data "$set_data" > /dev/null 2>&1
+            set_exit=$?
+            set -e
+        else
+            local status
+            local curl_exit=0
+            set +e
+            status="$(curl -sS --connect-timeout 10 --max-time 30 \
+                -o /dev/null -w "%{http_code}" -X POST \
+                -H "Authorization: Bearer $TOKEN" \
+                --data-urlencode "component=$PROJECT_KEY" \
+                --data-urlencode "key=$setting_key" \
+                --data-urlencode "value=previous_version" \
+                "$SERVER_URL/api/settings/set")"
+            curl_exit=$?
+            set -e
+            if [[ "$curl_exit" -ne 0 ]]; then
+                log_info "Could not reach SonarQube Cloud to set project settings. Non-critical — continuing."
+                return
+            fi
+            case "$status" in
+                200|204) set_exit=0 ;;
+                403)
+                    log_info "Could not set new code definition (HTTP 403). You may lack admin permissions on this project."
+                    return
+                    ;;
+                *)
+                    log_info "Could not set new code definition (HTTP $status). Non-critical — continuing."
+                    return
+                    ;;
+            esac
         fi
 
-        case "$status" in
-            200|204) ;;
-            403)
-                log_info "Could not set new code definition (HTTP 403). You may lack admin permissions on this project."
-                return
-                ;;
-            *)
-                log_info "Could not set new code definition (HTTP $status). Non-critical — continuing."
-                return
-                ;;
-        esac
+        if [[ "$set_exit" -ne 0 ]]; then
+            log_info "Could not set new code definition. Non-critical — continuing."
+            return
+        fi
     done
 
     log_success "New code definition set to 'previous version'."
@@ -772,7 +988,9 @@ ensure_scanner() {
 # Function: run_scan
 # ---------------------------------------------------------------------------
 run_scan() {
-    export SONAR_TOKEN="$TOKEN"
+    if [[ -n "$TOKEN" ]]; then
+        export SONAR_TOKEN="$TOKEN"
+    fi
     export SONAR_HOST_URL="$SERVER_URL"
 
     local project_root
@@ -887,9 +1105,14 @@ show_results() {
     sleep 3
 
     local gate_response gate_status display_status
-    gate_response="$(curl -sS --connect-timeout 10 --max-time 30 \
-        -H "Authorization: Bearer $TOKEN" \
-        "$SERVER_URL/api/qualitygates/project_status?projectKey=$PROJECT_KEY" 2>/dev/null || true)"
+
+    if [[ "$SONAR_CLI_HAS_API" = true ]]; then
+        gate_response="$("$SONAR_CLI" api get "/api/qualitygates/project_status?projectKey=$PROJECT_KEY" 2>/dev/null || true)"
+    else
+        gate_response="$(curl -sS --connect-timeout 10 --max-time 30 \
+            -H "Authorization: Bearer $TOKEN" \
+            "$SERVER_URL/api/qualitygates/project_status?projectKey=$PROJECT_KEY" 2>/dev/null || true)"
+    fi
 
     gate_status="$(echo "$gate_response" | jq -r '.projectStatus.status // empty' 2>/dev/null || true)"
 
@@ -971,11 +1194,13 @@ maybe_integrate_claude() {
 main() {
     parse_args "$@"
     check_prerequisites
-    if [[ -z "$TOKEN" ]] || [[ -z "$ORG_KEY" ]] || [[ "$INTEGRATE_CLAUDE" = true ]]; then
+    detect_sonar_cli || true
+    if [[ -z "$SONAR_CLI" ]] && { [[ -z "$TOKEN" ]] || [[ -z "$ORG_KEY" ]] || [[ "$INTEGRATE_CLAUDE" = true ]]; }; then
         ensure_sonar_cli
     fi
     ensure_auth
     detect_project_info
+    validate_org_access
     ensure_project_exists
     configure_project_settings
     write_config_files
