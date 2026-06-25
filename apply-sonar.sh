@@ -19,6 +19,7 @@ SCANNER_VERSION="8.0.1.6346"
 SCANNER_CMD=""
 USE_DOCKER=false
 MSG_SCANNER_READY="sonar-scanner ready."
+CURL_FMT_HTTP_CODE="%{http_code}"
 
 TMPFILES=()
 mktmp() {
@@ -477,7 +478,7 @@ validate_org_access() {
         local curl_exit=0
         set +e
         http_code="$(curl -sS --connect-timeout 10 --max-time 30 \
-            -o "$tmp_org" -w "%{http_code}" \
+            -o "$tmp_org" -w "$CURL_FMT_HTTP_CODE" \
             -H "Authorization: Bearer $TOKEN" \
             "$SERVER_URL/api/organizations/search?organizations=$ORG_KEY&member=true")"
         curl_exit=$?
@@ -628,7 +629,7 @@ ensure_project_exists_via_curl() {
     local curl_exit=0
     set +e
     http_code="$(curl -sS --connect-timeout 10 --max-time 30 \
-        -o "$tmp_body" -w "%{http_code}" \
+        -o "$tmp_body" -w "$CURL_FMT_HTTP_CODE" \
         -H "Authorization: Bearer $TOKEN" \
         "$SERVER_URL/api/components/show?component=$PROJECT_KEY")"
     curl_exit=$?
@@ -667,7 +668,7 @@ ensure_project_exists_via_curl() {
     curl_exit=0
     set +e
     create_code="$(curl -sS --connect-timeout 10 --max-time 30 \
-        -o "$tmp_create" -w "%{http_code}" -X POST \
+        -o "$tmp_create" -w "$CURL_FMT_HTTP_CODE" -X POST \
         -H "Authorization: Bearer $TOKEN" \
         --data-urlencode "organization=$ORG_KEY" \
         --data-urlencode "project=$PROJECT_KEY" \
@@ -767,7 +768,7 @@ configure_project_settings() {
             local curl_exit=0
             set +e
             status="$(curl -sS --connect-timeout 10 --max-time 30 \
-                -o /dev/null -w "%{http_code}" -X POST \
+                -o /dev/null -w "$CURL_FMT_HTTP_CODE" -X POST \
                 -H "Authorization: Bearer $TOKEN" \
                 --data-urlencode "component=$PROJECT_KEY" \
                 --data-urlencode "key=$setting_key" \
