@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Mock git shim for testing apply-sonar.sh
+# Delegates most calls to real git, but intercepts 'remote get-url origin'.
+
+# Find the real git (skip our mock in PATH)
+real_git=""
+while IFS= read -r candidate; do
+    if [[ "$candidate" != "${BASH_SOURCE[0]}" ]] && [[ "$candidate" != "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/git" ]]; then
+        real_git="$candidate"
+        break
+    fi
+done < <(which -a git 2>/dev/null)
+
+if [[ -z "$real_git" ]]; then
+    # Fallback: try common locations
+    for candidate in /usr/bin/git /usr/local/bin/git /opt/homebrew/bin/git; do
+        if [[ -x "$candidate" ]]; then
+            real_git="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ -z "$real_git" ]]; then
+    echo "mock git: cannot find real git" >&2
+    exit 1
+fi
+
+# Intercept specific commands
+if [[ "${1:-}" = "remote" ]] && [[ "${2:-}" = "get-url" ]] && [[ "${3:-}" = "origin" ]]; then
+    if [[ -n "${MOCK_GIT_REMOTE_URL:-}" ]]; then
+        echo "$MOCK_GIT_REMOTE_URL"
+        exit 0
+    fi
+fi
+
+# Delegate everything else to real git
+exec "$real_git" "$@"

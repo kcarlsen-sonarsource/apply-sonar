@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Mock sonar CLI shim for testing apply-sonar.sh
+# Behavior is controlled by environment variables.
+# All calls are logged to $TEST_TMPDIR/sonar_calls.
+set -euo pipefail
+
+FIXTURE_DIR="${FIXTURE_DIR:-test/fixtures}"
+
+# Log every invocation
+if [[ -n "${TEST_TMPDIR:-}" ]]; then
+    echo "sonar $*" >> "$TEST_TMPDIR/sonar_calls"
+fi
+
+subcmd="${1:-}"
+shift || true
+
+case "$subcmd" in
+    auth)
+        action="${1:-}"
+        shift || true
+        case "$action" in
+            status)
+                if [[ "${MOCK_SONAR_AUTH_STATUS_EXIT:-0}" -ne 0 ]]; then
+                    echo "${MOCK_SONAR_AUTH_STATUS_OUT:-Not authenticated.}" >&2
+                    exit "${MOCK_SONAR_AUTH_STATUS_EXIT}"
+                fi
+                echo "${MOCK_SONAR_AUTH_STATUS_OUT:-Authenticated.
+Server https://sonarcloud.io
+Org    my-org}"
+                exit 0
+                ;;
+            login)
+                exit "${MOCK_SONAR_AUTH_LOGIN_EXIT:-0}"
+                ;;
+            logout)
+                exit 0
+                ;;
+            *)
+                echo "Unknown auth action: $action" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    api)
+        action="${1:-}"
+        shift || true
+
+        case "$action" in
+            --help)
+                if [[ "${MOCK_SONAR_API_SUPPORTED:-true}" = "true" ]]; then
+                    echo "Usage: sonar api [get|post] <url>"
+                    exit 0
+                else
+                    echo "Unknown command: api" >&2
+                    exit 1
+                fi
+                ;;
+            get|post)
+                url="${1:-}"
+                shift || true
+
+                # Parse optional --data flag for post
+                post_data=""
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --data)
+                            post_data="${2:-}"
+                            shift 2 || true
+                            ;;
+                        *)
+                            shift
+                            ;;
+                    esac
+                done
+
+                # Log the detailed call
+                if [[ -n "${TEST_TMPDIR:-}" ]]; then
+                    echo "sonar api $action $url data=$post_data" >> "$TEST_TMPDIR/sonar_api_calls"
+                fi
+
+                # Match URL to fixture
+                case "$url" in
+                    */api/authentication/validate*)
+                        if [[ "${MOCK_SONAR_API_AUTH_VALID:-true}" = "true" ]]; then
+                            cat "$FIXTURE_DIR/auth_validate_valid.json"
+                        else
+                            cat "$FIXTURE_DIR/auth_validate_invalid.json"
+                        fi
+                        ;;
+                    */api/organizations/search*member=true*)
+                        if [[ "${MOCK_SONAR_API_ORG_MEMBER:-true}" = "true" ]]; then
+                            cat "$FIXTURE_DIR/org_search_member.json"
+                        else
+                            cat "$FIXTURE_DIR/org_search_not_member.json"
+                        fi
+                        ;;
+                    */api/organizations/search*)
+                        if [[ "${MOCK_SONAR_API_ORG_EXISTS:-true}" = "true" ]]; then
+                            cat "$FIXTURE_DIR/org_search_public_exists.json"
+                        else
+                            cat "$FIXTURE_DIR/org_search_public_not_found.json"
+                        fi
+                        ;;
+                    */api/components/show*)
+                        if [[ "${MOCK_SONAR_API_PROJECT_EXISTS:-false}" = "true" ]]; then
+                            cat "$FIXTURE_DIR/component_show_exists.json"
+                        else
+                            # Simulate a failed exit code for project not found
+                            echo '{"errors":[{"msg":"Component key not found"}]}' >&2
+                            exit "${MOCK_SONAR_API_COMPONENT_EXIT:-1}"
+                        fi
+                        ;;
+                    */api/projects/create*)
+                        case "${MOCK_SONAR_API_PROJECT_CREATE:-success}" in
+                            success)
+                                cat "$FIXTURE_DIR/project_create_success.json"
+                                ;;
+                            no_org)
+                                echo "No organization for key 'bad-org'" >&2
+                                exit 1
+                                ;;
+                            key_exists)
+                                echo "key already exists: my-org_my-project" >&2
+                                exit 1
+                                ;;
+                            permission_denied)
+                                echo "Insufficient privileges" >&2
+                                exit 1
+                                ;;
+                            *)
+                                echo "Unknown project create error" >&2
+                                exit 1
+                                ;;
+                        esac
+                        ;;
+                    */api/settings/set*)
+                        exit "${MOCK_SONAR_API_SETTINGS_EXIT:-0}"
+                        ;;
+                    */api/qualitygates/project_status*)
+                        case "${MOCK_SONAR_API_QUALITY_GATE:-ok}" in
+                            ok)    cat "$FIXTURE_DIR/quality_gate_ok.json" ;;
+                            error) cat "$FIXTURE_DIR/quality_gate_error.json" ;;
+                            none)  cat "$FIXTURE_DIR/quality_gate_none.json" ;;
+                        esac
+                        ;;
+                    *)
+                        echo '{}'
+                        ;;
+                esac
+                ;;
+            *)
+                echo "Unknown api action: $action" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    integrate)
+        target="${1:-}"
+        shift || true
+        case "$target" in
+            claude)
+                if [[ "${MOCK_SONAR_INTEGRATE_SUPPORTED:-true}" = "true" ]]; then
+                    # Parse --help
+                    for arg in "$@"; do
+                        if [[ "$arg" = "--help" ]]; then
+                            echo "Usage: sonar integrate claude [options]"
+                            exit 0
+                        fi
+                    done
+                    exit "${MOCK_SONAR_INTEGRATE_EXIT:-0}"
+                else
+                    echo "Unknown command: integrate" >&2
+                    exit 1
+                fi
+                ;;
+            *)
+                echo "Unknown integrate target: $target" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "Unknown command: $subcmd" >&2
+        exit 1
+        ;;
+esac

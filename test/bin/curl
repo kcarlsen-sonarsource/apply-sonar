@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Mock curl shim for testing apply-sonar.sh
+# Matches URL patterns against MOCK_CURL_RESPONSES or built-in defaults.
+# Logs all calls to $TEST_TMPDIR/curl_calls.
+set -euo pipefail
+
+FIXTURE_DIR="${FIXTURE_DIR:-test/fixtures}"
+
+# Parse curl arguments
+output_file=""
+write_format=""
+auth_header=""
+method="GET"
+url=""
+data_parts=()
+download_mode=false
+
+args=("$@")
+i=0
+while [[ $i -lt ${#args[@]} ]]; do
+    arg="${args[$i]}"
+    case "$arg" in
+        -o)
+            i=$((i + 1))
+            output_file="${args[$i]}"
+            ;;
+        -w)
+            i=$((i + 1))
+            write_format="${args[$i]}"
+            ;;
+        -H)
+            i=$((i + 1))
+            header="${args[$i]}"
+            if [[ "$header" == Authorization:* ]]; then
+                auth_header="$header"
+            fi
+            ;;
+        -X)
+            i=$((i + 1))
+            method="${args[$i]}"
+            ;;
+        --data-urlencode)
+            i=$((i + 1))
+            data_parts+=("${args[$i]}")
+            method="POST"
+            ;;
+        --data|--data-raw)
+            i=$((i + 1))
+            data_parts+=("${args[$i]}")
+            ;;
+        -sS|-s)
+            # silent mode, ignore
+            ;;
+        -fsSL|-fSL)
+            download_mode=true
+            ;;
+        --proto)
+            i=$((i + 1))
+            # proto value consumed but not used in mock
+            ;;
+        --connect-timeout|--max-time)
+            i=$((i + 1))
+            # ignore timeout values
+            ;;
+        -*)
+            # ignore other flags
+            ;;
+        *)
+            # This should be the URL
+            if [[ -z "$url" ]]; then
+                url="$arg"
+            fi
+            ;;
+    esac
+    i=$((i + 1))
+done
+
+# If there were data parts with no explicit -X, it's a POST
+if [[ ${#data_parts[@]} -gt 0 ]] && [[ "$method" = "GET" ]]; then
+    method="POST"
+fi
+
+# Log the call
+if [[ -n "${TEST_TMPDIR:-}" ]]; then
+    echo "$method $url auth=${auth_header}" >> "$TEST_TMPDIR/curl_calls"
+fi
+
+# Handle download/install URLs — just succeed silently
+if [[ "$download_mode" = "true" ]]; then
+    if [[ -n "$output_file" ]]; then
+        echo "mock-download-content" > "$output_file"
+    fi
+    exit 0
+fi
+
+# Handle piped install scripts (curl ... | bash pattern)
+# If stdout is a pipe and url looks like an install script, emit a no-op
+if [[ "$url" == *install.sh* ]]; then
+    echo "echo 'mock install complete'"
+    exit 0
+fi
+
+# Determine response based on URL pattern
+http_code="200"
+response_body=""
+
+case "$url" in
+    */api/authentication/validate*)
+        if [[ "${MOCK_CURL_AUTH_VALID:-true}" = "true" ]]; then
+            response_body='{"valid":true}'
+        else
+            response_body='{"valid":false}'
+        fi
+        ;;
+    */api/organizations/search*member=true*)
+        if [[ "${MOCK_CURL_ORG_MEMBER:-true}" = "true" ]]; then
+            response_body="$(cat "$FIXTURE_DIR/org_search_member.json")"
+        else
+            response_body="$(cat "$FIXTURE_DIR/org_search_not_member.json")"
+        fi
+        ;;
+    */api/organizations/search*)
+        if [[ "${MOCK_CURL_ORG_EXISTS:-true}" = "true" ]]; then
+            response_body="$(cat "$FIXTURE_DIR/org_search_public_exists.json")"
+        else
+            response_body="$(cat "$FIXTURE_DIR/org_search_public_not_found.json")"
+        fi
+        ;;
+    */api/components/show*)
+        if [[ "${MOCK_CURL_PROJECT_EXISTS:-false}" = "true" ]]; then
+            response_body="$(cat "$FIXTURE_DIR/component_show_exists.json")"
+            http_code="200"
+        else
+            response_body="$(cat "$FIXTURE_DIR/component_show_404.json")"
+            http_code="${MOCK_CURL_COMPONENT_HTTP:-404}"
+        fi
+        ;;
+    */api/projects/create*)
+        case "${MOCK_CURL_PROJECT_CREATE:-success}" in
+            success)
+                response_body="$(cat "$FIXTURE_DIR/project_create_success.json")"
+                http_code="200"
+                ;;
+            no_org)
+                response_body="$(cat "$FIXTURE_DIR/project_create_no_org.json")"
+                http_code="404"
+                ;;
+            key_exists)
+                response_body="$(cat "$FIXTURE_DIR/project_create_key_exists.json")"
+                http_code="200"
+                ;;
+            permission_denied)
+                response_body="$(cat "$FIXTURE_DIR/project_create_403.json")"
+                http_code="403"
+                ;;
+            *)
+                response_body='{"errors":[{"msg":"Unknown error"}]}'
+                http_code="500"
+                ;;
+        esac
+        ;;
+    */api/settings/set*)
+        response_body=""
+        http_code="${MOCK_CURL_SETTINGS_HTTP:-204}"
+        ;;
+    */api/qualitygates/project_status*)
+        case "${MOCK_CURL_QUALITY_GATE:-ok}" in
+            ok)    response_body="$(cat "$FIXTURE_DIR/quality_gate_ok.json")" ;;
+            error) response_body="$(cat "$FIXTURE_DIR/quality_gate_error.json")" ;;
+            none)  response_body="$(cat "$FIXTURE_DIR/quality_gate_none.json")" ;;
+        esac
+        ;;
+    *)
+        response_body=""
+        http_code="200"
+        ;;
+esac
+
+# Handle output: -o writes to file, otherwise to stdout
+if [[ -n "$output_file" ]]; then
+    echo "$response_body" > "$output_file"
+else
+    echo "$response_body"
+fi
+
+# Handle -w format string: replace %{http_code} with the code
+if [[ -n "$write_format" ]]; then
+    formatted="${write_format//%\{http_code\}/$http_code}"
+    printf '%s' "$formatted"
+fi
+
+exit "${MOCK_CURL_EXIT:-0}"

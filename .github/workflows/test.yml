@@ -1,0 +1,30 @@
+name: Tests
+on: [push, pull_request]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install shellcheck
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y shellcheck
+
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+
+      - name: Shellcheck apply-sonar.sh
+        run: shellcheck apply-sonar.sh
+
+      - name: Shellcheck mock shims
+        run: shellcheck test/bin/*
+
+      - name: Run BATS tests
+        run: ./test/run_tests.sh

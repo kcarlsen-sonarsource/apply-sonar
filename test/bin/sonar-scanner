@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Mock sonar-scanner shim for testing apply-sonar.sh
+set -euo pipefail
+
+if [[ -n "${TEST_TMPDIR:-}" ]]; then
+    echo "sonar-scanner $*" >> "$TEST_TMPDIR/scanner_calls"
+fi
+
+if [[ "${1:-}" = "--version" ]]; then
+    echo "SonarScanner CLI 8.0.1.6346"
+    exit 0
+fi
+
+# Simulate analysis
+echo "INFO: Analysis complete"
+exit "${MOCK_SCANNER_EXIT:-0}"

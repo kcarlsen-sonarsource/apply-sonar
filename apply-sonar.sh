@@ -1212,4 +1212,6 @@ main() {
     exit 0
 }
 
-main "$@"
+if [[ "${APPLY_SONAR_SOURCED:-}" != "1" ]]; then
+    main "$@"
+fi
