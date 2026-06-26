@@ -729,7 +729,7 @@ ensure_project_exists_via_curl() {
             local err_msg
             err_msg="$(echo "$create_body" | jq -r '.errors[]?.msg // empty' 2>/dev/null || echo "$create_body")"
             log_error "Unexpected response creating project (HTTP $create_code):" \
-                "${err_msg:-$(echo "$create_body")}"
+                "${err_msg:-$create_body}"
             exit 1
             ;;
     esac
